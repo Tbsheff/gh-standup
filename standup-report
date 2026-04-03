@@ -1,0 +1,1307 @@
+#!/bin/bash
+
+# Standup Report Script
+# =====================
+# Generates a standup report: PRs opened (today + yesterday), PRs needing review,
+# and open Linear issues. Uses GitHub GraphQL for cross-repo PR search.
+#
+# Usage: standup-report --org YOUR_ORG [--style STYLE] [--no-summary] [--help]
+
+set -euo pipefail
+
+# Configuration (override via env vars or CLI flags)
+STANDUP_ORG=${STANDUP_ORG:-}
+LINEAR_RECENCY_DAYS=${LINEAR_RECENCY_DAYS:-30}
+STANDUP_STYLE=${STANDUP_STYLE:-box}
+STANDUP_SUMMARY=${STANDUP_SUMMARY:-1}  # AI summary: 1=on, 0=off
+STANDUP_SUMMARY_MODEL=${STANDUP_SUMMARY_MODEL:-accounts/fireworks/routers/kimi-k2p5-turbo}
+STANDUP_SUMMARY_PROVIDER=${STANDUP_SUMMARY_PROVIDER:-fireworks}  # fireworks or claude
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+NC='\033[0m'
+
+# Background colors
+BG_BLUE='\033[44m'
+BG_GREEN='\033[42m'
+BG_YELLOW='\033[43m'
+BG_RED='\033[41m'
+BG_CYAN='\033[46m'
+BG_MAGENTA='\033[45m'
+
+# Box-drawing characters
+BOX_H='─'
+BOX_V='│'
+BOX_TL='┌'
+BOX_TR='┐'
+BOX_BL='└'
+BOX_BR='┘'
+BOX_T='┬'
+BOX_B='┴'
+BOX_L='├'
+BOX_R='┤'
+BOX_C='┼'
+
+# Function to print colored output
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Design helper functions
+draw_box() {
+    local width="${1:-80}"
+    local title="$2"
+    local style="${3:-single}"
+
+    if [ "$style" = "double" ]; then
+        local h='═'
+        local v='║'
+        local tl='╔'
+        local tr='╗'
+        local bl='╚'
+        local br='╝'
+    else
+        local h="$BOX_H"
+        local v="$BOX_V"
+        local tl="$BOX_TL"
+        local tr="$BOX_TR"
+        local bl="$BOX_BL"
+        local br="$BOX_BR"
+    fi
+
+    if [ -n "$title" ]; then
+        local title_len=${#title}
+        local padding=$((width - title_len - 2))
+        local left_pad=$((padding / 2))
+        local right_pad=$((padding - left_pad))
+        echo -e "${tl}$(printf "%*s" $((width - 2)) | tr ' ' "$h")${tr}"
+        echo -e "${v}$(printf "%*s" $left_pad | tr ' ' ' ')${title}$(printf "%*s" $right_pad | tr ' ' ' ')${v}"
+        echo -e "${bl}$(printf "%*s" $((width - 2)) | tr ' ' "$h")${br}"
+    else
+        echo -e "${tl}$(printf "%*s" $((width - 2)) | tr ' ' "$h")${tr}"
+    fi
+}
+
+draw_box_bottom() {
+    local width="${1:-80}"
+    local style="${2:-single}"
+
+    if [ "$style" = "double" ]; then
+        local bl='╚'
+        local br='╝'
+        local h='═'
+    else
+        local bl="$BOX_BL"
+        local br="$BOX_BR"
+        local h="$BOX_H"
+    fi
+
+    echo -e "${bl}$(printf "%*s" $((width - 2)) | tr ' ' "$h")${br}"
+}
+
+print_header() {
+    local text="$1"
+    local color="${2:-$BLUE}"
+    local bg_color="${3:-}"
+    local width="${4:-80}"
+
+    if [ -n "$bg_color" ]; then
+        echo -e "${bg_color}${WHITE}${BOLD}$(printf "%-${width}s" "$text")${NC}"
+    else
+        local padding=$((width - ${#text} - 4))
+        echo -e "${color}${BOLD}╔$(printf "%*s" $((width - 2)) | tr ' ' '═')╗${NC}"
+        echo -e "${color}${BOLD}║${NC}  ${BOLD}${text}${NC}$(printf "%*s" $padding | tr ' ' ' ')${color}${BOLD}║${NC}"
+        echo -e "${color}${BOLD}╚$(printf "%*s" $((width - 2)) | tr ' ' '═')╝${NC}"
+    fi
+}
+
+print_section_header() {
+    local text="$1"
+    local icon="$2"
+    local color="${3:-$CYAN}"
+
+    echo ""
+    echo -e "${color}${BOLD}${BOX_L}─ ${icon} ${text}${NC}"
+    echo -e "${color}${BOX_V}${NC}"
+}
+
+print_badge() {
+    local text="$1"
+    local color="${2:-$GREEN}"
+    local bg="${3:-}"
+
+    if [ -n "$bg" ]; then
+        echo -e "${bg}${WHITE}${BOLD} ${text} ${NC}"
+    else
+        echo -e "${color}${BOLD}[${text}]${NC}"
+    fi
+}
+
+truncate_text() {
+    local text="$1"
+    local max_len="${2:-60}"
+
+    if [ ${#text} -le "$max_len" ]; then
+        echo "$text"
+    else
+        echo "${text:0:$((max_len - 3))}..."
+    fi
+}
+
+get_terminal_width() {
+    local width
+    width=$(tput cols 2>/dev/null || echo "80")
+    if [ -z "$width" ] || [ "$width" -lt 40 ]; then
+        width=80
+    fi
+    echo "$width"
+}
+
+# Create clickable hyperlink (OSC 8 protocol)
+make_link() {
+    local url="$1"
+    local text="${2:-$url}"
+
+    if [ "${STANDUP_NO_HYPERLINKS:-}" = "1" ]; then
+        echo "$text"
+        return
+    fi
+
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$text"
+}
+
+make_button_link() {
+    local url="$1"
+    local text="${2:-Open}"
+    local color="${3:-$CYAN}"
+    local link_text=$(make_link "$url" "$text")
+    echo -e "${color}${BOLD}[${link_text}]${NC}"
+}
+
+# Check if required tools are installed
+check_dependencies() {
+    local missing_deps=()
+
+    if ! command -v gh &> /dev/null; then
+        missing_deps+=("gh (GitHub CLI)")
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        missing_deps+=("jq")
+    fi
+
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        print_error "Missing required dependencies:"
+        for dep in "${missing_deps[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        print_info "Install missing dependencies:"
+        echo "  brew install gh jq"
+        exit 1
+    fi
+
+    if ! command -v linear &> /dev/null; then
+        print_info "Note: Linear CLI not found. Linear issues will be skipped."
+        print_info "Install with: brew install linear"
+    fi
+}
+
+# Get today's date in YYYY-MM-DD format
+get_today_date() {
+    date +%Y-%m-%d
+}
+
+# Get yesterday's date in YYYY-MM-DD format
+get_yesterday_date() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        date -v-1d +%Y-%m-%d
+    else
+        date -d "yesterday" +%Y-%m-%d
+    fi
+}
+
+# Get current GitHub username
+get_current_user() {
+    gh api user --jq '.login'
+}
+
+# Format PR status with enhanced badges
+format_pr_status() {
+    local pr_json="$1"
+    local style="${2:-default}"
+    local status_parts=()
+
+    local is_draft=$(echo "$pr_json" | jq -r '.isDraft')
+    local review_decision=$(echo "$pr_json" | jq -r '.reviewDecision // "null"')
+
+    if [ "$style" = "badge" ]; then
+        if [ "$is_draft" = "true" ]; then
+            status_parts+=("${YELLOW}${BG_YELLOW}${WHITE} DRAFT ${NC}")
+        else
+            status_parts+=("${GREEN}${BG_GREEN}${WHITE} READY ${NC}")
+        fi
+
+        if [ "$review_decision" = "APPROVED" ]; then
+            status_parts+=("${CYAN}${BG_CYAN}${WHITE} APPROVED ${NC}")
+        elif [ "$review_decision" = "CHANGES_REQUESTED" ]; then
+            status_parts+=("${RED}${BG_RED}${WHITE} CHANGES ${NC}")
+        elif [ "$review_decision" = "REVIEW_REQUIRED" ] || [ "$review_decision" = "null" ]; then
+            status_parts+=("${YELLOW}${BG_YELLOW}${WHITE} REVIEW ${NC}")
+        fi
+    else
+        if [ "$is_draft" = "true" ]; then
+            status_parts+=("📝 Draft")
+        else
+            status_parts+=("✅ Ready")
+        fi
+
+        if [ "$review_decision" = "APPROVED" ]; then
+            status_parts+=("✅ Approved")
+        elif [ "$review_decision" = "CHANGES_REQUESTED" ]; then
+            status_parts+=("⚠️ Changes Requested")
+        elif [ "$review_decision" = "REVIEW_REQUIRED" ] || [ "$review_decision" = "null" ]; then
+            status_parts+=("⏳ Review Required")
+        fi
+    fi
+
+    local labels=$(echo "$pr_json" | jq -r '.labels[].name' 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    if [ -n "$labels" ]; then
+        status_parts+=("🏷️ $labels")
+    fi
+
+    local result=""
+    for i in "${!status_parts[@]}"; do
+        if [ $i -gt 0 ]; then
+            result+=" "
+        fi
+        result+="${status_parts[$i]}"
+    done
+    echo "$result"
+}
+
+# Extract short repo name from "org/repo" format
+repo_short() {
+    echo "$1" | sed 's|.*/||'
+}
+
+# Word-wrap a bullet point with box-drawing prefix
+# First line gets "- ", continuation lines align after it
+wrap_bullet() {
+    local text="$1"
+    local color="${2:-\033[2m}"
+    local w=$(get_terminal_width)
+    local wrap_width=$((w - 8))
+    local prefix="\033[2m│\033[0m     "
+
+    echo "- $text" | fold -s -w "$wrap_width" | while IFS= read -r wrapped_line; do
+        echo -e "${prefix}${color}$wrapped_line\033[0m"
+    done
+}
+
+# ============================================================
+# Data Fetching (GraphQL, cross-repo, org-scoped)
+# ============================================================
+
+# Get authored open PRs from today + yesterday using GitHub GraphQL search
+get_authored_prs() {
+    local yesterday="$1"
+    local org="$2"
+
+    local search_query="author:@me created:>=${yesterday} org:${org} is:pr is:open"
+
+    gh api graphql -f query="
+    {
+      search(query: \"${search_query}\", type: ISSUE, first: 50) {
+        nodes {
+          ... on PullRequest {
+            number
+            title
+            url
+            isDraft
+            reviewDecision
+            createdAt
+            repository { nameWithOwner }
+            labels(first: 5) { nodes { name } }
+          }
+        }
+      }
+    }" --jq '.data.search.nodes | [.[] | select(.number != null) | {
+        number,
+        title,
+        url,
+        isDraft,
+        reviewDecision,
+        createdAt,
+        repo: .repository.nameWithOwner,
+        labels: [.labels.nodes[]]
+    }]' 2>/dev/null || echo "[]"
+}
+
+# Get PRs merged today + yesterday
+get_merged_prs() {
+    local yesterday="$1"
+    local org="$2"
+
+    local search_query="author:@me is:pr is:merged merged:>=${yesterday} org:${org}"
+
+    gh api graphql -f query="
+    {
+      search(query: \"${search_query}\", type: ISSUE, first: 50) {
+        nodes {
+          ... on PullRequest {
+            number
+            title
+            url
+            mergedAt
+            repository { nameWithOwner }
+            labels(first: 5) { nodes { name } }
+          }
+        }
+      }
+    }" --jq '.data.search.nodes | [.[] | select(.number != null) | {
+        number,
+        title,
+        url,
+        mergedAt,
+        repo: .repository.nameWithOwner,
+        labels: [.labels.nodes[]]
+    }]' 2>/dev/null || echo "[]"
+}
+
+# Get PRs where review is requested from you
+get_review_requested_prs() {
+    local org="$1"
+
+    local search_query="review-requested:@me is:pr is:open org:${org}"
+
+    gh api graphql -f query="
+    {
+      search(query: \"${search_query}\", type: ISSUE, first: 50) {
+        nodes {
+          ... on PullRequest {
+            number
+            title
+            url
+            isDraft
+            reviewDecision
+            createdAt
+            author { login }
+            repository { nameWithOwner }
+          }
+        }
+      }
+    }" --jq '.data.search.nodes | [.[] | select(.number != null and .isDraft == false and (.reviewDecision == "REVIEW_REQUIRED" or .reviewDecision == null)) | {
+        number,
+        title,
+        url,
+        isDraft,
+        reviewDecision,
+        createdAt,
+        author: {login: .author.login},
+        repo: .repository.nameWithOwner
+    }]' 2>/dev/null || echo "[]"
+}
+
+# Get Linear issues assigned to current user (only recently active ones)
+get_linear_issues() {
+    if ! command -v linear &> /dev/null; then
+        echo "[]"
+        return 0
+    fi
+
+    local cutoff_date
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        cutoff_date=$(date -v-${LINEAR_RECENCY_DAYS}d +%Y-%m-%d 2>/dev/null || echo "")
+    else
+        cutoff_date=$(date -d "${LINEAR_RECENCY_DAYS} days ago" +%Y-%m-%d 2>/dev/null || echo "")
+    fi
+
+    local teams
+    teams=$(linear team list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk 'NR>1 && $1 != "" && $1 != "KEY" && $1 != "Usage:" && $1 != "Version:" && $1 != "Description:" && $1 != "Options:" && $1 != "Commands:" && $1 != "List" {print $1}' | grep -E '^[A-Z]{2,4}$') || {
+        print_info "Warning: Could not fetch Linear teams. Skipping Linear issues."
+        echo "[]"
+        return 0
+    }
+
+    if [ -z "$teams" ]; then
+        echo "[]"
+        return 0
+    fi
+
+    local all_issues=()
+
+    while IFS= read -r team; do
+        if [ -z "$team" ] || [[ ! "$team" =~ ^[A-Z]{2,4}$ ]]; then
+            continue
+        fi
+
+        local team_issues
+        team_issues=$(LINEAR_ISSUE_SORT=priority linear issue list \
+            --team "$team" \
+            --state unstarted \
+            --state started \
+            --no-pager 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g') || continue
+
+        if [ -z "$team_issues" ] || [[ "$team_issues" =~ "Could not determine team key" ]] || [[ "$team_issues" =~ "^[[:space:]]*$" ]]; then
+            continue
+        fi
+
+        while IFS= read -r line; do
+            if [ -z "$line" ] || \
+               [[ "$line" =~ ^[[:space:]]*$ ]] || \
+               [[ "$line" =~ ^[[:space:]]*ID[[:space:]]+TITLE ]] || \
+               [[ "$line" =~ ^[[:space:]]*[▄▆█◌]+[[:space:]]*$ ]]; then
+                continue
+            fi
+
+            local issue_id
+            issue_id=$(echo "$line" | grep -oE '[A-Z]{2,4}-[0-9]+' | head -1)
+
+            if [ -z "$issue_id" ]; then
+                continue
+            fi
+
+            local updated_str
+            updated_str=$(echo "$line" | grep -oE '[0-9]+ (hours?|days?) ago' | head -1)
+
+            if [ -n "$cutoff_date" ] && [ -n "$updated_str" ]; then
+                local days_ago=0
+                if [[ "$updated_str" =~ ([0-9]+)[[:space:]]+days?[[:space:]]+ago ]]; then
+                    days_ago="${BASH_REMATCH[1]}"
+                elif [[ "$updated_str" =~ ([0-9]+)[[:space:]]+hours?[[:space:]]+ago ]]; then
+                    days_ago=0
+                fi
+
+                if [ "$days_ago" -gt "$LINEAR_RECENCY_DAYS" ]; then
+                    continue
+                fi
+            fi
+
+            local title
+            title=$(echo "$line" | sed "s/.*$issue_id[[:space:]]*//" | sed 's/[[:space:]]*-[[:space:]]*In Progress.*//' | sed 's/[[:space:]]*-[[:space:]]*In Review.*//' | sed 's/[[:space:]]*-[[:space:]]*[0-9].*//' | sed 's/[[:space:]]*Scheduling Task.*//' | sed 's/[[:space:]]*Epic.*//' | sed 's/[[:space:]]*Us.*//' | sed 's/[[:space:]]*$//')
+
+            title=$(echo "$title" | sed 's/[[:space:]]*-[[:space:]]*$//' | sed 's/[[:space:]]*$//' | xargs)
+
+            if [ -n "$title" ] && [ "$title" != "" ] && [ ${#title} -gt 3 ]; then
+                local url
+                url=$(linear issue url "$issue_id" 2>/dev/null | tr -d '\n\r' || echo "")
+
+                local issue_json
+                issue_json=$(jq -n \
+                    --arg id "$issue_id" \
+                    --arg title "$title" \
+                    --arg url "$url" \
+                    --arg team "$team" \
+                    --arg updated "$updated_str" \
+                    '{id: $id, title: $title, url: $url, team: $team, updated: $updated}' 2>/dev/null) || continue
+
+                if [ -n "$issue_json" ]; then
+                    all_issues+=("$issue_json")
+                fi
+            fi
+        done <<< "$team_issues"
+    done <<< "$teams"
+
+    if [ ${#all_issues[@]} -eq 0 ]; then
+        echo "[]"
+    else
+        printf '%s\n' "${all_issues[@]}" | jq -s '.' 2>/dev/null || echo "[]"
+    fi
+}
+
+# ============================================================
+# Rendering
+# ============================================================
+
+render_box_style() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local date="$4"
+    local merged_json="${5:-[]}"
+    local width=$(get_terminal_width)
+    local today=$(get_today_date)
+    local yesterday=$(get_yesterday_date)
+    local formatted_date=$(date "+%a %b %-d" 2>/dev/null || date "+%a %b %d")
+
+    # Header
+    echo ""
+    draw_box "$width" "📊 Standup · $formatted_date"
+    echo ""
+
+    # ── Action Items ──
+    local merged_count=$(echo "$merged_json" | jq 'length' 2>/dev/null || echo "0")
+    local approved_count=$(echo "$prs_json" | jq '[.[] | select(.isDraft == false and .reviewDecision == "APPROVED")] | length' 2>/dev/null || echo "0")
+    local changes_count=$(echo "$prs_json" | jq '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
+    local review_pr_count=$(echo "$prs_needing_review_json" | jq 'length' 2>/dev/null || echo "0")
+
+    echo -e "  ${BOLD}⚡ Action Items${NC}"
+    [ "${merged_count:-0}" -gt 0 ] && echo -e "  ${GREEN}🚀 $merged_count shipped${NC}"
+    [ "${approved_count:-0}" -gt 0 ] && echo -e "  ${GREEN}🟢 $approved_count approved → ready to merge${NC}"
+    [ "${changes_count:-0}" -gt 0 ] && echo -e "  ${RED}🔴 $changes_count with changes requested${NC}"
+    [ "${review_pr_count:-0}" -gt 0 ] && echo -e "  ${YELLOW}👀 $review_pr_count PR(s) need your review${NC}"
+    if [ "${merged_count:-0}" -eq 0 ] && [ "${approved_count:-0}" -eq 0 ] && [ "${changes_count:-0}" -eq 0 ] && [ "${review_pr_count:-0}" -eq 0 ]; then
+        echo -e "  ${DIM}No action items${NC}"
+    fi
+    echo ""
+
+    # ── Collect all repos from both merged + open ──
+    local all_repos
+    all_repos=$(echo "$merged_json $prs_json" | jq -rs '[.[][].repo // empty] | unique | .[]' 2>/dev/null)
+
+    if [ -n "$all_repos" ]; then
+        while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            local repo_name=$(repo_short "$repo")
+
+            # Count merged + open for this repo
+            local repo_merged_count=$(echo "$merged_json" | jq --arg r "$repo" '[.[] | select(.repo == $r)] | length' 2>/dev/null || echo "0")
+            local repo_open_count=$(echo "$prs_json" | jq --arg r "$repo" '[.[] | select(.repo == $r and .isDraft == false)] | length' 2>/dev/null || echo "0")
+            local repo_draft_count=$(echo "$prs_json" | jq --arg r "$repo" '[.[] | select(.repo == $r and .isDraft == true)] | length' 2>/dev/null || echo "0")
+
+            # Build subtitle
+            local subtitle_parts=()
+            [ "${repo_merged_count:-0}" -gt 0 ] && subtitle_parts+=("$repo_merged_count shipped")
+            [ "${repo_open_count:-0}" -gt 0 ] && subtitle_parts+=("$repo_open_count open")
+            [ "${repo_draft_count:-0}" -gt 0 ] && subtitle_parts+=("$repo_draft_count draft")
+            local subtitle=$(IFS=', '; echo "${subtitle_parts[*]}")
+
+            echo -e "${CYAN}${BOLD}${BOX_TL}─ $repo_name${NC} ${DIM}($subtitle)${NC}"
+            echo -e "${CYAN}${BOX_V}${NC}"
+
+            # ── Shipped (merged PRs for this repo) ──
+            if [ "${repo_merged_count:-0}" -gt 0 ]; then
+                echo -e "${CYAN}${BOX_V}${NC}  ${GREEN}${BOLD}🚀 Shipped${NC}"
+
+                echo "$merged_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r)] | sort_by(.mergedAt) | reverse | .[]' 2>/dev/null | while IFS= read -r pr; do
+                    local title=$(echo "$pr" | jq -r '.title')
+                    local number=$(echo "$pr" | jq -r '.number')
+                    local url=$(echo "$pr" | jq -r '.url')
+                    local merged_at=$(echo "$pr" | jq -r '.mergedAt')
+                    local merge_date=$(echo "$merged_at" | cut -d'T' -f1)
+                    local labels=$(echo "$pr" | jq -r '[.labels[].name // empty] | join(", ")' 2>/dev/null)
+                    local title_short=$(truncate_text "$title" $((width - 25)))
+
+                    local day_tag=""
+                    if [ "$merge_date" = "$today" ]; then
+                        day_tag="  ${GREEN}today${NC}"
+                    elif [ "$merge_date" = "$yesterday" ]; then
+                        day_tag="  ${DIM}yesterday${NC}"
+                    fi
+
+                    local label_tag=""
+                    [ -n "$labels" ] && [ "$labels" != "" ] && label_tag="  ${DIM}$labels${NC}"
+
+                    printf "${CYAN}${BOX_V}${NC}   ${GREEN}✓${NC} ${BOLD}$title_short${NC}  ${DIM}"
+                    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "#$number"
+                    printf "${NC}$day_tag$label_tag\n"
+                done
+
+                echo -e "${CYAN}${BOX_V}${NC}"
+            fi
+
+            # ── Open (non-draft PRs for this repo) ──
+            if [ "${repo_open_count:-0}" -gt 0 ]; then
+                echo -e "${CYAN}${BOX_V}${NC}  ${BLUE}${BOLD}Open${NC}"
+
+                echo "$prs_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r and .isDraft == false)] | sort_by(.createdAt) | reverse | .[]' 2>/dev/null | while IFS= read -r pr; do
+                    local title=$(echo "$pr" | jq -r '.title')
+                    local number=$(echo "$pr" | jq -r '.number')
+                    local url=$(echo "$pr" | jq -r '.url')
+                    local review_decision=$(echo "$pr" | jq -r '.reviewDecision // "null"')
+                    local labels=$(echo "$pr" | jq -r '[.labels[].name // empty] | join(", ")' 2>/dev/null)
+                    local title_short=$(truncate_text "$title" $((width - 25)))
+
+                    local icon="${BLUE}○${NC}"
+                    local status_tag=""
+                    if [ "$review_decision" = "APPROVED" ]; then
+                        icon="${GREEN}🟢${NC}"
+                        status_tag="  ${GREEN}APPROVED${NC}"
+                    elif [ "$review_decision" = "CHANGES_REQUESTED" ]; then
+                        icon="${RED}🔴${NC}"
+                        status_tag="  ${RED}CHANGES${NC}"
+                    fi
+
+                    local label_tag=""
+                    [ -n "$labels" ] && [ "$labels" != "" ] && label_tag="  ${DIM}$labels${NC}"
+
+                    printf "${CYAN}${BOX_V}${NC}   $icon ${BOLD}$title_short${NC}  ${DIM}"
+                    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "#$number"
+                    printf "${NC}$status_tag$label_tag\n"
+                done
+
+                echo -e "${CYAN}${BOX_V}${NC}"
+            fi
+
+            # ── Drafts (collapsed) ──
+            if [ "${repo_draft_count:-0}" -gt 0 ]; then
+                local draft_groups
+                draft_groups=$(echo "$prs_json" | jq -c --arg r "$repo" \
+                    '[.[] | select(.repo == $r and .isDraft == true)] |
+                     group_by(.title) | .[] |
+                     {title: .[0].title, numbers: [.[].number], urls: [.[].url], count: length}' 2>/dev/null)
+
+                if [ -n "$draft_groups" ]; then
+                    echo "$draft_groups" | while IFS= read -r group; do
+                        local draft_title=$(echo "$group" | jq -r '.title')
+                        local draft_count=$(echo "$group" | jq -r '.count')
+                        local draft_numbers=$(echo "$group" | jq -r '.numbers | map("#\(.)") | join(", ")')
+
+                        if [ "$draft_count" -gt 1 ]; then
+                            echo -e "${CYAN}${BOX_V}${NC}   ${YELLOW}📝${NC} ${DIM}$draft_count drafts ($draft_numbers)${NC}"
+                        else
+                            local draft_url=$(echo "$group" | jq -r '.urls[0]')
+                            local draft_num=$(echo "$group" | jq -r '.numbers[0]')
+                            local draft_title_short=$(truncate_text "$draft_title" $((width - 20)))
+                            printf "${CYAN}${BOX_V}${NC}   ${YELLOW}📝${NC} ${DIM}$draft_title_short${NC}  ${DIM}"
+                            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$draft_url" "#$draft_num"
+                            printf "${NC}\n"
+                        fi
+                    done
+                    echo -e "${CYAN}${BOX_V}${NC}"
+                fi
+            fi
+
+            echo -e "${CYAN}${BOX_BL}${BOX_H}${NC}"
+            echo ""
+        done <<< "$all_repos"
+    fi
+
+    # ── PRs Needing Review ──
+    if [ "${review_pr_count:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}${BOLD}${BOX_TL}─ 👀 Needs Your Review${NC}"
+        echo -e "${YELLOW}${BOX_V}${NC}"
+
+        echo "$prs_needing_review_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local author=$(echo "$pr" | jq -r '.author.login')
+            local url=$(echo "$pr" | jq -r '.url')
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+            local title_short=$(truncate_text "$title" $((width - 30)))
+
+            printf "${YELLOW}${BOX_V}${NC}   ${YELLOW}⚠${NC} ${DIM}$repo_name${NC} ${BOLD}$title_short${NC}  ${DIM}"
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "#$number"
+            printf "${NC} by @$author\n"
+        done
+
+        echo -e "${YELLOW}${BOX_V}${NC}"
+        echo -e "${YELLOW}${BOX_BL}${BOX_H}${NC}"
+        echo ""
+    fi
+
+    # ── Linear Issues ──
+    local linear_count=$(echo "$linear_issues_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "${linear_count:-0}" -gt 0 ]; then
+        echo -e "${MAGENTA}${BOLD}${BOX_TL}─ 📋 Linear Issues ($linear_count)${NC}"
+        echo -e "${MAGENTA}${BOX_V}${NC}"
+
+        echo "$linear_issues_json" | jq -c '.[]' | while IFS= read -r issue; do
+            local title=$(echo "$issue" | jq -r '.title')
+            local id=$(echo "$issue" | jq -r '.id')
+            local url=$(echo "$issue" | jq -r '.url')
+            local team=$(echo "$issue" | jq -r '.team')
+            local title_short=$(truncate_text "$title" $((width - 20)))
+
+            if [ -n "$url" ] && [ "$url" != "null" ] && [ "$url" != "" ]; then
+                printf "${MAGENTA}${BOX_V}${NC}   ${BOLD}[$team]${NC} $title_short  ${DIM}"
+                printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$id"
+                printf "${NC}\n"
+            else
+                echo -e "${MAGENTA}${BOX_V}${NC}   ${BOLD}[$team]${NC} $title_short ${DIM}$id${NC}"
+            fi
+        done
+
+        echo -e "${MAGENTA}${BOX_V}${NC}"
+        echo -e "${MAGENTA}${BOX_BL}${BOX_H}${NC}"
+    fi
+}
+
+render_colorful_style() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local date="$4"
+    local width=$(get_terminal_width)
+    local today=$(get_today_date)
+    local yesterday=$(get_yesterday_date)
+
+    echo ""
+    echo -e "${BG_BLUE}${WHITE}${BOLD}$(printf "%-${width}s" "  📊 Standup Report - Today & Yesterday's Work ($STANDUP_ORG)  ")${NC}"
+    echo ""
+
+    # PRs Section
+    local pr_count=$(echo "$prs_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$pr_count" -gt 0 ]; then
+        echo -e "${BG_GREEN}${WHITE}${BOLD}  🔀 Pull Requests Opened ($pr_count)  ${NC}"
+        echo ""
+
+        local index=1
+        echo "$prs_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local url=$(echo "$pr" | jq -r '.url')
+            local created_at=$(echo "$pr" | jq -r '.createdAt')
+            local pr_date=$(echo "$created_at" | cut -d'T' -f1)
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+            local status=$(format_pr_status "$pr" "badge")
+            local is_draft=$(echo "$pr" | jq -r '.isDraft')
+            local review_decision=$(echo "$pr" | jq -r '.reviewDecision // "null"')
+
+            local badge_color="$GREEN"
+            local icon="●"
+            if [ "$is_draft" = "true" ]; then
+                badge_color="$YELLOW"
+                icon="📝"
+            elif [ "$review_decision" = "APPROVED" ]; then
+                badge_color="$CYAN"
+                icon="✓"
+            fi
+
+            local date_label=""
+            if [ "$pr_date" = "$today" ]; then
+                date_label="${GREEN}[Today]${NC}"
+            elif [ "$pr_date" = "$yesterday" ]; then
+                date_label="${DIM}[Yesterday]${NC}"
+            fi
+
+            echo -e "  ${badge_color}${BOLD}$icon${NC} ${DIM}$repo_name${NC} ${BOLD}$(truncate_text "$title" $((width - 25)))${NC} $date_label"
+            printf "     ${DIM}"
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "PR #$number"
+            printf "${NC} $status\n"
+            echo ""
+            index=$((index + 1))
+        done
+    fi
+
+    # PRs Needing Review
+    local prs_review_count=$(echo "$prs_needing_review_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$prs_review_count" -gt 0 ]; then
+        echo -e "${BG_YELLOW}${WHITE}${BOLD}  👀 PRs Needing Your Review ($prs_review_count)  ${NC}"
+        echo ""
+
+        local index=1
+        echo "$prs_needing_review_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local author=$(echo "$pr" | jq -r '.author.login')
+            local url=$(echo "$pr" | jq -r '.url')
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+
+            echo -e "  ${YELLOW}${BOLD}⚠${NC} ${DIM}$repo_name${NC} ${BOLD}$(truncate_text "$title" $((width - 20)))${NC}"
+            printf "     ${DIM}"
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "PR #$number"
+            printf "${NC} by @$author\n"
+            echo ""
+            index=$((index + 1))
+        done
+    fi
+
+    # Linear Issues
+    local linear_count=$(echo "$linear_issues_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$linear_count" -gt 0 ]; then
+        echo -e "${BG_MAGENTA}${WHITE}${BOLD}  📋 Open Linear Issues ($linear_count)  ${NC}"
+        echo ""
+
+        local index=1
+        echo "$linear_issues_json" | jq -c '.[]' | while IFS= read -r issue; do
+            local title=$(echo "$issue" | jq -r '.title')
+            local id=$(echo "$issue" | jq -r '.id')
+            local team=$(echo "$issue" | jq -r '.team')
+            local url=$(echo "$issue" | jq -r '.url')
+
+            echo -e "  ${MAGENTA}${BOLD}■${NC} ${BOLD}[$team]${NC} $(truncate_text "$title" $((width - 15)))"
+            if [ -n "$url" ] && [ "$url" != "null" ] && [ "$url" != "" ]; then
+                printf "     ${DIM}"
+                printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$id"
+                printf "${NC}\n"
+            else
+                echo -e "     ${DIM}$id${NC}"
+            fi
+            echo ""
+            index=$((index + 1))
+        done
+    fi
+}
+
+render_table_style() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local date="$4"
+    local width=$(get_terminal_width)
+    local today=$(get_today_date)
+    local yesterday=$(get_yesterday_date)
+
+    echo -e "${BOLD}${CYAN}╔$(printf "%*s" $((width - 2)) | tr ' ' '═')╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC} $(printf "%-$((width - 4))s" "📊 Standup Report - Today & Yesterday's Work ($STANDUP_ORG)") ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚$(printf "%*s" $((width - 2)) | tr ' ' '═')╝${NC}"
+    echo ""
+
+    # PRs Table
+    local pr_count=$(echo "$prs_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$pr_count" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}Pull Requests Opened (Today & Yesterday)${NC}"
+        echo ""
+
+        echo "$prs_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local url=$(echo "$pr" | jq -r '.url')
+            local created_at=$(echo "$pr" | jq -r '.createdAt')
+            local pr_date=$(echo "$created_at" | cut -d'T' -f1)
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+            local title_short=$(truncate_text "$title" $((width - 35)))
+
+            local date_label=""
+            if [ "$pr_date" = "$today" ]; then
+                date_label="${GREEN}Today${NC}"
+            elif [ "$pr_date" = "$yesterday" ]; then
+                date_label="${DIM}Yesterday${NC}"
+            else
+                date_label="$pr_date"
+            fi
+
+            printf "  ${DIM}$repo_name${NC} ${BOLD}$title_short${NC} $date_label "
+            printf "${DIM}"
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "PR #$number"
+            printf "${NC}\n"
+        done
+        echo ""
+    fi
+
+    # Linear Issues Table
+    local linear_count=$(echo "$linear_issues_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$linear_count" -gt 0 ]; then
+        echo -e "${BOLD}${MAGENTA}Open Linear Issues${NC}"
+        echo ""
+
+        local index=1
+        echo "$linear_issues_json" | jq -c '.[]' | while IFS= read -r issue; do
+            local title=$(echo "$issue" | jq -r '.title')
+            local id=$(echo "$issue" | jq -r '.id')
+            local team=$(echo "$issue" | jq -r '.team')
+            local title_short=$(truncate_text "$title" $((width - 20)))
+
+            printf "  ${MAGENTA}${BOLD}[$team]${NC} $title_short ${DIM}$id${NC}\n"
+            index=$((index + 1))
+        done
+    fi
+}
+
+render_minimal_style() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local date="$4"
+    local today=$(get_today_date)
+    local yesterday=$(get_yesterday_date)
+
+    echo -e "${BOLD}📊 Standup Report ($STANDUP_ORG)${NC}"
+    echo ""
+
+    local pr_count=$(echo "$prs_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$pr_count" -gt 0 ]; then
+        echo -e "${GREEN}${BOLD}🔀 Pull Requests ($pr_count)${NC}"
+        echo "$prs_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local url=$(echo "$pr" | jq -r '.url')
+            local created_at=$(echo "$pr" | jq -r '.createdAt')
+            local pr_date=$(echo "$created_at" | cut -d'T' -f1)
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+
+            local date_label=""
+            if [ "$pr_date" = "$today" ]; then
+                date_label="${GREEN}[Today]${NC}"
+            elif [ "$pr_date" = "$yesterday" ]; then
+                date_label="${DIM}[Yesterday]${NC}"
+            fi
+
+            printf "  ${GREEN}✓${NC} ${DIM}$repo_name${NC} $title ${DIM}("
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "#$number"
+            printf ")${NC} $date_label\n"
+        done
+        echo ""
+    fi
+
+    local prs_review_count=$(echo "$prs_needing_review_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$prs_review_count" -gt 0 ]; then
+        echo -e "${YELLOW}${BOLD}👀 Needs Review ($prs_review_count)${NC}"
+        echo "$prs_needing_review_json" | jq -c '.[]' | while IFS= read -r pr; do
+            local title=$(echo "$pr" | jq -r '.title')
+            local number=$(echo "$pr" | jq -r '.number')
+            local url=$(echo "$pr" | jq -r '.url')
+            local repo=$(echo "$pr" | jq -r '.repo // ""')
+            local repo_name=$(repo_short "$repo")
+            printf "  ${YELLOW}⚠${NC} ${DIM}$repo_name${NC} $title ${DIM}("
+            printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "#$number"
+            printf ")${NC}\n"
+        done
+        echo ""
+    fi
+
+    local linear_count=$(echo "$linear_issues_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "$linear_count" -gt 0 ]; then
+        echo -e "${MAGENTA}${BOLD}📋 Linear Issues ($linear_count)${NC}"
+        echo "$linear_issues_json" | jq -c '.[]' | while IFS= read -r issue; do
+            local title=$(echo "$issue" | jq -r '.title')
+            local id=$(echo "$issue" | jq -r '.id')
+            local team=$(echo "$issue" | jq -r '.team')
+            local url=$(echo "$issue" | jq -r '.url')
+            if [ -n "$url" ] && [ "$url" != "null" ] && [ "$url" != "" ]; then
+                printf "  ${MAGENTA}■${NC} [$team] $title ${DIM}("
+                printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$id"
+                printf ")${NC}\n"
+            else
+                echo -e "  ${MAGENTA}■${NC} [$team] $title ${DIM}($id)${NC}"
+            fi
+        done
+    fi
+}
+
+# ============================================================
+# AI Summary
+# ============================================================
+
+generate_summary() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local merged_json="${4:-[]}"
+
+    # Pre-format a draft standup from the data, then ask the model to condense it.
+    # This approach gives the model less to think about — it just groups and cleans.
+    local data_file=$(mktemp)
+
+    echo "Yesterday:" >> "$data_file"
+    local merged_count=$(echo "$merged_json" | jq -r 'length' 2>/dev/null || echo "0")
+    if [ "${merged_count:-0}" -gt 0 ]; then
+        echo "$merged_json" | jq -r '.[] | "- \(.title)"' 2>/dev/null >> "$data_file"
+    else
+        echo "- (nothing merged)" >> "$data_file"
+    fi
+
+    echo "Today:" >> "$data_file"
+    local open_count=$(echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | length' 2>/dev/null || echo "0")
+    if [ "${open_count:-0}" -gt 0 ]; then
+        echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | .[] | "- \(.title)"' 2>/dev/null >> "$data_file"
+    else
+        echo "- (nothing in progress)" >> "$data_file"
+    fi
+
+    echo "Blockers:" >> "$data_file"
+    local review_count=$(echo "$prs_needing_review_json" | jq -r 'length' 2>/dev/null || echo "0")
+    local changes_count=$(echo "$prs_json" | jq '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
+    if [ "${review_count:-0}" -gt 0 ] || [ "${changes_count:-0}" -gt 0 ]; then
+        [ "${changes_count:-0}" -gt 0 ] && echo "$prs_json" | jq -r '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | .[] | "- Changes requested on: \(.title)"' 2>/dev/null >> "$data_file"
+        [ "${review_count:-0}" -gt 0 ] && echo "$prs_needing_review_json" | jq -r '.[] | "- Needs review: \(.title) by @\(.author.login)"' 2>/dev/null >> "$data_file"
+    else
+        echo "- None" >> "$data_file"
+    fi
+
+    local system_prompt="You condense standup drafts into JSON. Merge similar items. 2-4 bullets per section max. Output ONLY valid JSON, nothing else."
+    local user_prompt="Condense this standup draft. Merge similar items into one bullet. Max 4 per section. Output as JSON:
+
+{\"yesterday\":[\"bullet 1\",\"bullet 2\"],\"today\":[\"bullet 1\",\"bullet 2\"],\"blockers\":[\"bullet 1\"]}
+
+$(cat "$data_file")"
+
+    local output=""
+
+    if [ "$STANDUP_SUMMARY_PROVIDER" = "fireworks" ]; then
+        # Fireworks Anthropic-compatible API (separates thinking from content)
+        if [ -z "${FIREWORKS_API_KEY:-}" ]; then
+            rm -f "$data_file"
+            return 1
+        fi
+
+        # Write prompt to file so jq can read it with proper escaping
+        # (--arg doesn't handle embedded newlines in shell variables)
+        local prompt_file=$(mktemp)
+        echo "$user_prompt" > "$prompt_file"
+
+        local payload
+        payload=$(jq -n \
+            --arg model "$STANDUP_SUMMARY_MODEL" \
+            --arg system "$system_prompt" \
+            --rawfile user "$prompt_file" \
+            '{
+                model: $model,
+                max_tokens: 4096,
+                thinking: {type: "enabled", budget_tokens: 2000},
+                system: $system,
+                messages: [
+                    {role: "user", content: $user}
+                ]
+            }')
+        rm -f "$prompt_file"
+
+        output=$(curl -s --max-time 45 \
+            https://api.fireworks.ai/inference/v1/messages \
+            -H "x-api-key: $FIREWORKS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$payload" 2>/dev/null | jq -r '.content[] | select(.type == "text") | .text' 2>/dev/null || echo "")
+    else
+        # Claude CLI fallback
+        if ! command -v claude &> /dev/null; then
+            rm -f "$data_file"
+            return 1
+        fi
+        output=$(timeout 45 claude --model haiku -p "$user_prompt" < /dev/null 2>/dev/null || echo "")
+    fi
+
+    rm -f "$data_file"
+
+    if [ -z "$output" ]; then
+        return 1
+    fi
+
+    # Extract JSON from the output (handles reasoning models that prefix with thinking)
+    local json
+    json=$(echo "$output" | grep -o '{.*}' | tail -1)
+
+    if [ -n "$json" ] && echo "$json" | jq empty 2>/dev/null; then
+        echo "$json"
+    else
+        return 1
+    fi
+}
+
+# ============================================================
+# Report Generation
+# ============================================================
+
+generate_standup_report() {
+    local prs_json="$1"
+    local prs_needing_review_json="$2"
+    local linear_issues_json="$3"
+    local date="$4"
+    local merged_json="${5:-[]}"
+
+    [ -z "$prs_json" ] || [ "$prs_json" = "" ] && prs_json="[]"
+    [ -z "$prs_needing_review_json" ] || [ "$prs_needing_review_json" = "" ] && prs_needing_review_json="[]"
+    [ -z "$linear_issues_json" ] || [ "$linear_issues_json" = "" ] && linear_issues_json="[]"
+    [ -z "$merged_json" ] || [ "$merged_json" = "" ] && merged_json="[]"
+
+    case "$STANDUP_STYLE" in
+        box)
+            render_box_style "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$date" "$merged_json"
+            ;;
+        colorful)
+            render_colorful_style "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$date"
+            ;;
+        table)
+            render_table_style "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$date"
+            ;;
+        minimal)
+            render_minimal_style "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$date"
+            ;;
+        *)
+            print_error "Unknown style: $STANDUP_STYLE"
+            print_info "Available styles: box, colorful, table, minimal"
+            render_box_style "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$date" "$merged_json"
+            ;;
+    esac
+
+    # Generate and display AI summary if enabled
+    if [ "$STANDUP_SUMMARY" = "1" ]; then
+        printf "${DIM}Generating summary...${NC}"
+        local summary_output
+        summary_output=$(generate_summary "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$merged_json" 2>&1)
+        printf "\r\033[K"
+        if [ -n "$summary_output" ] && echo "$summary_output" | jq empty 2>/dev/null; then
+            echo -e "${DIM}${BOX_TL}─ 📝 Standup${NC}"
+            echo -e "${DIM}${BOX_V}${NC}"
+
+            echo -e "${DIM}${BOX_V}${NC}  ${GREEN}${BOLD}Yesterday${NC}"
+            echo "$summary_output" | jq -r '.yesterday[]' 2>/dev/null | while IFS= read -r bullet; do
+                wrap_bullet "$bullet" "$DIM"
+            done
+            echo -e "${DIM}${BOX_V}${NC}"
+
+            echo -e "${DIM}${BOX_V}${NC}  ${BLUE}${BOLD}Today${NC}"
+            echo "$summary_output" | jq -r '.today[]' 2>/dev/null | while IFS= read -r bullet; do
+                wrap_bullet "$bullet" "$DIM"
+            done
+            echo -e "${DIM}${BOX_V}${NC}"
+
+            echo -e "${DIM}${BOX_V}${NC}  ${YELLOW}${BOLD}Blockers${NC}"
+            echo "$summary_output" | jq -r '.blockers[]' 2>/dev/null | while IFS= read -r bullet; do
+                if [[ "$bullet" == "None" ]] || [[ "$bullet" == "none" ]]; then
+                    echo -e "${DIM}${BOX_V}${NC}     ${DIM}- None${NC}"
+                else
+                    wrap_bullet "$bullet" "$YELLOW"
+                fi
+            done
+            echo -e "${DIM}${BOX_V}${NC}"
+            echo -e "${DIM}${BOX_BL}${BOX_H}${NC}"
+            echo ""
+        fi
+    fi
+}
+
+# ============================================================
+# CLI
+# ============================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --style)
+                if [ -z "${2:-}" ]; then
+                    print_error "--style requires a value"
+                    exit 1
+                fi
+                STANDUP_STYLE="$2"
+                shift 2
+                ;;
+            --org)
+                if [ -z "${2:-}" ]; then
+                    print_error "--org requires a value"
+                    exit 1
+                fi
+                STANDUP_ORG="$2"
+                shift 2
+                ;;
+            --summary)
+                STANDUP_SUMMARY=1
+                shift
+                ;;
+            --no-summary)
+                STANDUP_SUMMARY=0
+                shift
+                ;;
+            --model)
+                if [ -z "${2:-}" ]; then
+                    print_error "--model requires a value"
+                    exit 1
+                fi
+                STANDUP_SUMMARY_MODEL="$2"
+                shift 2
+                ;;
+            --provider)
+                if [ -z "${2:-}" ]; then
+                    print_error "--provider requires a value (fireworks or claude)"
+                    exit 1
+                fi
+                STANDUP_SUMMARY_PROVIDER="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: standup-report [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  --style STYLE  Rendering style: box, colorful, table, minimal (default: box)"
+                echo "  --org ORG      GitHub org to search PRs in (auto-detected if not set)"
+                echo "  --summary      Enable AI summary (default)"
+                echo "  --no-summary   Disable AI summary"
+                echo "  --model MODEL  Fireworks model ID (default: kimi-k2p5-turbo)"
+                echo "  --provider P   Summary provider: fireworks or claude (default: fireworks)"
+                echo "  -h, --help     Show this help"
+                echo ""
+                echo "Environment variables:"
+                echo "  STANDUP_STYLE          Default style (default: box)"
+                echo "  STANDUP_ORG            GitHub org (auto-detected if not set)"
+                echo "  STANDUP_SUMMARY        AI summary: 1=on, 0=off (default: 1)"
+                echo "  STANDUP_SUMMARY_MODEL  Fireworks model (default: kimi-k2p5-turbo)"
+                echo "  STANDUP_SUMMARY_PROVIDER  fireworks or claude (default: fireworks)"
+                echo "  LINEAR_RECENCY_DAYS    Days to look back for Linear issues (default: 30)"
+                echo "  STANDUP_NO_HYPERLINKS  Set to 1 to disable clickable links"
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# ============================================================
+# Main (parallelized data fetching)
+# ============================================================
+
+main() {
+    parse_args "$@"
+
+    check_dependencies
+
+    # Require org — auto-detect from first GitHub org if not set
+    if [ -z "$STANDUP_ORG" ]; then
+        STANDUP_ORG=$(gh api user/orgs --jq '.[0].login' 2>/dev/null || echo "")
+        if [ -z "$STANDUP_ORG" ]; then
+            print_error "No GitHub org found. Specify one with --org or STANDUP_ORG env var."
+            exit 1
+        fi
+        print_info "Auto-detected org: ${BOLD}$STANDUP_ORG${NC} (set STANDUP_ORG or use --org to override)"
+    fi
+
+    local today=$(get_today_date)
+    local yesterday=$(get_yesterday_date)
+
+    # Temp files for parallel output
+    local tmp_prs=$(mktemp)
+    local tmp_merged=$(mktemp)
+    local tmp_review=$(mktemp)
+    local tmp_linear=$(mktemp)
+
+    # Launch all 4 fetches in parallel
+    printf "${DIM}Fetching data from GitHub + Linear...${NC}"
+    (get_authored_prs "$yesterday" "$STANDUP_ORG" > "$tmp_prs" 2>/dev/null) &
+    local pid_prs=$!
+    (get_merged_prs "$yesterday" "$STANDUP_ORG" > "$tmp_merged" 2>/dev/null) &
+    local pid_merged=$!
+    (get_review_requested_prs "$STANDUP_ORG" > "$tmp_review" 2>/dev/null) &
+    local pid_review=$!
+    (get_linear_issues > "$tmp_linear" 2>/dev/null) &
+    local pid_linear=$!
+
+    # Wait for all
+    wait $pid_prs $pid_merged $pid_review $pid_linear 2>/dev/null || true
+
+    local prs_json=$(cat "$tmp_prs" 2>/dev/null || echo "[]")
+    local merged_json=$(cat "$tmp_merged" 2>/dev/null || echo "[]")
+    local prs_needing_review_json=$(cat "$tmp_review" 2>/dev/null || echo "[]")
+    local linear_issues_json=$(cat "$tmp_linear" 2>/dev/null || echo "[]")
+
+    rm -f "$tmp_prs" "$tmp_merged" "$tmp_review" "$tmp_linear"
+
+    # Validate JSON
+    echo "$prs_json" | jq empty 2>/dev/null || prs_json="[]"
+    echo "$merged_json" | jq empty 2>/dev/null || merged_json="[]"
+    echo "$prs_needing_review_json" | jq empty 2>/dev/null || prs_needing_review_json="[]"
+    echo "$linear_issues_json" | jq empty 2>/dev/null || linear_issues_json="[]"
+
+    # Clear the loading message
+    printf "\r\033[K"
+
+    generate_standup_report "$prs_json" "$prs_needing_review_json" "$linear_issues_json" "$today" "$merged_json"
+}
+
+main "$@"
