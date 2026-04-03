@@ -15,7 +15,7 @@ LINEAR_RECENCY_DAYS=${LINEAR_RECENCY_DAYS:-30}
 STANDUP_STYLE=${STANDUP_STYLE:-box}
 STANDUP_SUMMARY=${STANDUP_SUMMARY:-1}  # AI summary: 1=on, 0=off
 STANDUP_SUMMARY_MODEL=${STANDUP_SUMMARY_MODEL:-accounts/fireworks/routers/kimi-k2p5-turbo}
-STANDUP_SUMMARY_PROVIDER=${STANDUP_SUMMARY_PROVIDER:-fireworks}  # fireworks or claude
+STANDUP_SUMMARY_PROVIDER=${STANDUP_SUMMARY_PROVIDER:-auto}  # auto, fireworks, or claude
 
 # Colors for output
 RED='\033[0;31m'
@@ -1076,8 +1076,20 @@ $(cat "$data_file")"
 
     local output=""
 
-    if [ "$STANDUP_SUMMARY_PROVIDER" = "fireworks" ]; then
-        # Fireworks Anthropic-compatible API (separates thinking from content)
+    # Auto-detect provider: fireworks if API key set, else claude if CLI exists
+    local provider="$STANDUP_SUMMARY_PROVIDER"
+    if [ "$provider" = "auto" ]; then
+        if [ -n "${FIREWORKS_API_KEY:-}" ]; then
+            provider="fireworks"
+        elif command -v claude &>/dev/null; then
+            provider="claude"
+        else
+            rm -f "$data_file"
+            return 1
+        fi
+    fi
+
+    if [ "$provider" = "fireworks" ]; then
         if [ -z "${FIREWORKS_API_KEY:-}" ]; then
             rm -f "$data_file"
             return 1
@@ -1111,12 +1123,17 @@ $(cat "$data_file")"
             -H "anthropic-version: 2023-06-01" \
             -d "$payload" 2>/dev/null | jq -r '.content[] | select(.type == "text") | .text' 2>/dev/null || echo "")
     else
-        # Claude CLI fallback
-        if ! command -v claude &> /dev/null; then
+        # Claude CLI
+        if ! command -v claude &>/dev/null; then
             rm -f "$data_file"
             return 1
         fi
-        output=$(timeout 45 claude --model haiku -p "$user_prompt" < /dev/null 2>/dev/null || echo "")
+        local claude_prompt_file=$(mktemp)
+        echo "$system_prompt" > "$claude_prompt_file"
+        echo "" >> "$claude_prompt_file"
+        echo "$user_prompt" >> "$claude_prompt_file"
+        output=$(timeout 60 claude --model haiku -p "$(cat "$claude_prompt_file")" < /dev/null 2>/dev/null || echo "")
+        rm -f "$claude_prompt_file"
     fi
 
     rm -f "$data_file"
@@ -1291,7 +1308,7 @@ parse_args() {
                 echo "  --summary      Enable AI summary (default)"
                 echo "  --no-summary   Disable AI summary"
                 echo "  --model MODEL  Fireworks model ID (default: kimi-k2p5-turbo)"
-                echo "  --provider P   Summary provider: fireworks or claude (default: fireworks)"
+                echo "  --provider P   Summary provider: auto, fireworks, or claude (default: auto)"
                 echo "  -h, --help     Show this help"
                 echo ""
                 echo "Environment variables:"
@@ -1299,7 +1316,7 @@ parse_args() {
                 echo "  STANDUP_ORG            GitHub org (auto-detected if not set)"
                 echo "  STANDUP_SUMMARY        AI summary: 1=on, 0=off (default: 1)"
                 echo "  STANDUP_SUMMARY_MODEL  Fireworks model (default: kimi-k2p5-turbo)"
-                echo "  STANDUP_SUMMARY_PROVIDER  fireworks or claude (default: fireworks)"
+                echo "  STANDUP_SUMMARY_PROVIDER  auto, fireworks, or claude (default: auto)"
                 echo "  LINEAR_RECENCY_DAYS    Days to look back for Linear issues (default: 30)"
                 echo "  STANDUP_NO_HYPERLINKS  Set to 1 to disable clickable links"
                 exit 0
