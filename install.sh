@@ -48,12 +48,50 @@ ok "GitHub CLI authenticated"
 # Install as gh extension (preferred) or standalone
 if gh extension install "$REPO" 2>/dev/null; then
     ok "Installed as gh extension"
+
+    # Create 'standup' alias so users can just type 'standup'
+    alias_installed=false
+    if [ -f "$HOME/.config/fish/config.fish" ]; then
+        if ! grep -q 'standup' "$HOME/.config/fish/config.fish" 2>/dev/null; then
+            echo "" >> "$HOME/.config/fish/config.fish"
+            echo "alias standup 'gh standup'" >> "$HOME/.config/fish/config.fish"
+            ok "Added ${BOLD}standup${NC} alias to ~/.config/fish/config.fish"
+            alias_installed=true
+        else
+            ok "Fish alias already exists"
+            alias_installed=true
+        fi
+    fi
+    if [ -f "$HOME/.zshrc" ]; then
+        if ! grep -q "alias standup=" "$HOME/.zshrc" 2>/dev/null; then
+            echo "" >> "$HOME/.zshrc"
+            echo "alias standup='gh standup'" >> "$HOME/.zshrc"
+            ok "Added ${BOLD}standup${NC} alias to ~/.zshrc"
+            alias_installed=true
+        else
+            ok "Zsh alias already exists"
+            alias_installed=true
+        fi
+    fi
+    if [ -f "$HOME/.bashrc" ]; then
+        if ! grep -q "alias standup=" "$HOME/.bashrc" 2>/dev/null; then
+            echo "" >> "$HOME/.bashrc"
+            echo "alias standup='gh standup'" >> "$HOME/.bashrc"
+            ok "Added ${BOLD}standup${NC} alias to ~/.bashrc"
+            alias_installed=true
+        fi
+    fi
+    if [ "$alias_installed" = false ]; then
+        info "Add this alias to your shell config:"
+        echo "  alias standup='gh standup'"
+    fi
+
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo "  gh standup                     # auto-detects your GitHub org"
-    echo "  gh standup --org mycompany     # specify org"
-    echo "  gh standup --no-summary        # skip AI summary"
-    echo "  gh standup --help              # all options"
+    echo "  standup                        # just works"
+    echo "  standup --org mycompany        # specify org"
+    echo "  standup --no-summary           # skip AI summary"
+    echo "  standup --help                 # all options"
 else
     info "gh extension install failed, installing standalone..."
     mkdir -p "$INSTALL_DIR"
