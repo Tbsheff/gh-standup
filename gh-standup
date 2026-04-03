@@ -1252,9 +1252,14 @@ main() {
 
     check_dependencies
 
-    # Require org — auto-detect from first GitHub org if not set
+    # Require org — auto-detect from most recent PR activity if not set
     if [ -z "$STANDUP_ORG" ]; then
-        STANDUP_ORG=$(gh api user/orgs --jq '.[0].login' 2>/dev/null || echo "")
+        # Find the org where you actually have recent PRs, not just membership
+        STANDUP_ORG=$(gh api graphql -f query='{ search(query: "author:@me is:pr sort:updated-desc", type: ISSUE, first: 1) { nodes { ... on PullRequest { repository { owner { login } } } } } }' --jq '.data.search.nodes[0].repository.owner.login' 2>/dev/null || echo "")
+        if [ -z "$STANDUP_ORG" ]; then
+            # Fallback to first org membership
+            STANDUP_ORG=$(gh api user/orgs --jq '.[0].login' 2>/dev/null || echo "")
+        fi
         if [ -z "$STANDUP_ORG" ]; then
             print_error "No GitHub org found. Specify one with --org or STANDUP_ORG env var."
             exit 1
