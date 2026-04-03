@@ -370,7 +370,11 @@ get_merged_prs() {
             number
             title
             url
+            body
             mergedAt
+            additions
+            deletions
+            changedFiles
             repository { nameWithOwner }
             labels(first: 5) { nodes { name } }
           }
@@ -380,7 +384,11 @@ get_merged_prs() {
         number,
         title,
         url,
+        body: (.body | split("\n")[0:5] | join(" ") | .[0:300]),
         mergedAt,
+        additions,
+        deletions,
+        changedFiles,
         repo: .repository.nameWithOwner,
         labels: [.labels.nodes[]]
     }]' 2>/dev/null || echo "[]"
@@ -993,27 +1001,30 @@ generate_summary() {
     local linear_issues_json="$3"
     local merged_json="${4:-[]}"
 
-    # Pre-format a draft standup from the data, then ask the model to condense it.
-    # This approach gives the model less to think about — it just groups and cleans.
+    # Build rich context for the summary — PR descriptions tell the real story
     local data_file=$(mktemp)
 
-    echo "Yesterday:" >> "$data_file"
+    # Merged PRs: include description + scale for real context
+    echo "=== MERGED PRs (what shipped) ===" >> "$data_file"
     local merged_count=$(echo "$merged_json" | jq -r 'length' 2>/dev/null || echo "0")
     if [ "${merged_count:-0}" -gt 0 ]; then
-        echo "$merged_json" | jq -r '.[] | "- \(.title)"' 2>/dev/null >> "$data_file"
+        echo "$merged_json" | jq -r '.[] | "PR: \(.title)\nDescription: \(.body // "no description")\nScale: +\(.additions // 0)/-\(.deletions // 0) across \(.changedFiles // 0) files\n"' 2>/dev/null >> "$data_file"
     else
-        echo "- (nothing merged)" >> "$data_file"
+        echo "(nothing merged)" >> "$data_file"
     fi
 
-    echo "Today:" >> "$data_file"
+    # Open PRs: just titles (enough for today's plan)
+    echo "=== OPEN PRs (in progress) ===" >> "$data_file"
     local open_count=$(echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | length' 2>/dev/null || echo "0")
     if [ "${open_count:-0}" -gt 0 ]; then
         echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | .[] | "- \(.title)"' 2>/dev/null >> "$data_file"
     else
-        echo "- (nothing in progress)" >> "$data_file"
+        echo "(nothing in progress)" >> "$data_file"
     fi
 
-    echo "Blockers:" >> "$data_file"
+    # Blockers
+    echo "" >> "$data_file"
+    echo "=== BLOCKERS ===" >> "$data_file"
     local review_count=$(echo "$prs_needing_review_json" | jq -r 'length' 2>/dev/null || echo "0")
     local changes_count=$(echo "$prs_json" | jq '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
     if [ "${review_count:-0}" -gt 0 ] || [ "${changes_count:-0}" -gt 0 ]; then
@@ -1023,10 +1034,23 @@ generate_summary() {
         echo "- None" >> "$data_file"
     fi
 
-    local system_prompt="You condense standup drafts into JSON. Merge similar items. 2-4 bullets per section max. Output ONLY valid JSON, nothing else."
-    local user_prompt="Condense this standup draft. Merge similar items into one bullet. Max 4 per section. Output as JSON:
+    local system_prompt="You write standup updates from PR data. Output ONLY valid JSON. No markdown. No explanation."
+    local user_prompt="Read these PRs and write a standup that explains what was actually accomplished, not just PR titles.
 
-{\"yesterday\":[\"bullet 1\",\"bullet 2\"],\"today\":[\"bullet 1\",\"bullet 2\"],\"blockers\":[\"bullet 1\"]}
+Bad example (just rephrases titles):
+{\"yesterday\":[\"add DI pattern for libcore database access\",\"enforce ctx.db in tRPC routers\"]}
+
+Good example (explains what was done and why):
+{\"yesterday\":[\"Laid foundation for database dependency injection — new libcore access pattern replaces direct prisma imports, with lint rule to enforce usage in routers\",\"Fixed delivery loop state sync bug where review head SHA diverged from QA checks\"]}
+
+Rules:
+- yesterday: what shipped. Use the PR description to understand what was actually done. Explain the WHY and IMPACT, not just the what.
+- today: what's planned. Infer the goal from open PR titles.
+- blockers: changes requested or reviews needed. Say None if clear.
+- 2-4 bullets per section. Group related PRs into one bullet.
+- Do NOT just rephrase PR titles. Summarize the actual work.
+
+Output as JSON: {\"yesterday\":[...],\"today\":[...],\"blockers\":[...]}
 
 $(cat "$data_file")"
 
