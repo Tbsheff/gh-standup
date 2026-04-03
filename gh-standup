@@ -1001,56 +1001,76 @@ generate_summary() {
     local linear_issues_json="$3"
     local merged_json="${4:-[]}"
 
-    # Build rich context for the summary — PR descriptions tell the real story
+    # Build rich context for the summary — grouped by repo
     local data_file=$(mktemp)
 
-    # Merged PRs: include description + scale for real context
-    echo "=== MERGED PRs (what shipped) ===" >> "$data_file"
-    local merged_count=$(echo "$merged_json" | jq -r 'length' 2>/dev/null || echo "0")
-    if [ "${merged_count:-0}" -gt 0 ]; then
-        echo "$merged_json" | jq -r '.[] | "PR: \(.title)\nDescription: \(.body // "no description")\nScale: +\(.additions // 0)/-\(.deletions // 0) across \(.changedFiles // 0) files\n"' 2>/dev/null >> "$data_file"
-    else
-        echo "(nothing merged)" >> "$data_file"
+    # Get unique repos across merged + open
+    local all_repos
+    all_repos=$(echo "$merged_json $prs_json" | jq -rs '[.[][].repo // empty] | unique | .[]' 2>/dev/null)
+
+    if [ -n "$all_repos" ]; then
+        while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            local repo_name
+            repo_name=$(echo "$repo" | sed 's|.*/||')
+
+            echo "=== REPO: $repo_name ===" >> "$data_file"
+
+            # Merged PRs for this repo
+            local repo_merged
+            repo_merged=$(echo "$merged_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r)]' 2>/dev/null || echo "[]")
+            local repo_merged_count=$(echo "$repo_merged" | jq 'length' 2>/dev/null || echo "0")
+
+            if [ "${repo_merged_count:-0}" -gt 0 ]; then
+                echo "SHIPPED:" >> "$data_file"
+                echo "$repo_merged" | jq -r '.[] | "PR: \(.title)\nDescription: \(.body // "no description")\nScale: +\(.additions // 0)/-\(.deletions // 0) across \(.changedFiles // 0) files\n"' 2>/dev/null >> "$data_file"
+            fi
+
+            # Open PRs for this repo
+            local repo_open
+            repo_open=$(echo "$prs_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r and .isDraft == false)]' 2>/dev/null || echo "[]")
+            local repo_open_count=$(echo "$repo_open" | jq 'length' 2>/dev/null || echo "0")
+
+            if [ "${repo_open_count:-0}" -gt 0 ]; then
+                echo "OPEN:" >> "$data_file"
+                echo "$repo_open" | jq -r '.[] | "- \(.title)"' 2>/dev/null >> "$data_file"
+            fi
+
+            # Blockers for this repo
+            local repo_changes
+            repo_changes=$(echo "$prs_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r and .reviewDecision == "CHANGES_REQUESTED")]' 2>/dev/null || echo "[]")
+            local repo_changes_count=$(echo "$repo_changes" | jq 'length' 2>/dev/null || echo "0")
+            local repo_reviews
+            repo_reviews=$(echo "$prs_needing_review_json" | jq -c --arg r "$repo" '[.[] | select(.repo == $r)]' 2>/dev/null || echo "[]")
+            local repo_reviews_count=$(echo "$repo_reviews" | jq 'length' 2>/dev/null || echo "0")
+
+            if [ "${repo_changes_count:-0}" -gt 0 ] || [ "${repo_reviews_count:-0}" -gt 0 ]; then
+                echo "BLOCKERS:" >> "$data_file"
+                [ "${repo_changes_count:-0}" -gt 0 ] && echo "$repo_changes" | jq -r '.[] | "- Changes requested: \(.title)"' 2>/dev/null >> "$data_file"
+                [ "${repo_reviews_count:-0}" -gt 0 ] && echo "$repo_reviews" | jq -r '.[] | "- Needs review: \(.title) by @\(.author.login)"' 2>/dev/null >> "$data_file"
+            fi
+
+            echo "" >> "$data_file"
+        done <<< "$all_repos"
     fi
 
-    # Open PRs: just titles (enough for today's plan)
-    echo "=== OPEN PRs (in progress) ===" >> "$data_file"
-    local open_count=$(echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | length' 2>/dev/null || echo "0")
-    if [ "${open_count:-0}" -gt 0 ]; then
-        echo "$prs_json" | jq -r '[.[] | select(.isDraft == false)] | .[] | "- \(.title)"' 2>/dev/null >> "$data_file"
-    else
-        echo "(nothing in progress)" >> "$data_file"
-    fi
-
-    # Blockers
-    echo "" >> "$data_file"
-    echo "=== BLOCKERS ===" >> "$data_file"
-    local review_count=$(echo "$prs_needing_review_json" | jq -r 'length' 2>/dev/null || echo "0")
-    local changes_count=$(echo "$prs_json" | jq '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
-    if [ "${review_count:-0}" -gt 0 ] || [ "${changes_count:-0}" -gt 0 ]; then
-        [ "${changes_count:-0}" -gt 0 ] && echo "$prs_json" | jq -r '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")] | .[] | "- Changes requested on: \(.title)"' 2>/dev/null >> "$data_file"
-        [ "${review_count:-0}" -gt 0 ] && echo "$prs_needing_review_json" | jq -r '.[] | "- Needs review: \(.title) by @\(.author.login)"' 2>/dev/null >> "$data_file"
-    else
-        echo "- None" >> "$data_file"
-    fi
+    # Build list of repo short names for the JSON schema
+    local repo_names
+    repo_names=$(echo "$all_repos" | sed 's|.*/||' | tr '\n' ',' | sed 's/,$//')
 
     local system_prompt="You write standup updates from PR data. Output ONLY valid JSON. No markdown. No explanation."
-    local user_prompt="Read these PRs and write a standup that explains what was actually accomplished, not just PR titles.
+    local user_prompt="Read these PRs grouped by repo and write a standup that explains what was actually accomplished.
 
-Bad example (just rephrases titles):
-{\"yesterday\":[\"add DI pattern for libcore database access\",\"enforce ctx.db in tRPC routers\"]}
-
-Good example (explains what was done and why):
-{\"yesterday\":[\"Laid foundation for database dependency injection — new libcore access pattern replaces direct prisma imports, with lint rule to enforce usage in routers\",\"Fixed delivery loop state sync bug where review head SHA diverged from QA checks\"]}
+Output JSON with repos as keys. Example:
+{\"repo-name\":{\"yesterday\":[\"what shipped and why\"],\"today\":[\"what is planned\"],\"blockers\":[\"any blockers or None\"]},\"other-repo\":{\"yesterday\":[...],\"today\":[...],\"blockers\":[...]}}
 
 Rules:
-- yesterday: what shipped. Use the PR description to understand what was actually done. Explain the WHY and IMPACT, not just the what.
-- today: what's planned. Infer the goal from open PR titles.
-- blockers: changes requested or reviews needed. Say None if clear.
-- 2-4 bullets per section. Group related PRs into one bullet.
-- Do NOT just rephrase PR titles. Summarize the actual work.
+- yesterday: use PR descriptions to explain WHAT was done and WHY. Not just titles.
+- today: infer the goal from open PR titles.
+- blockers: changes requested or reviews needed. Use [\"None\"] if clear.
+- 1-4 bullets per section per repo. Group related PRs.
 
-Output as JSON: {\"yesterday\":[...],\"today\":[...],\"blockers\":[...]}
+Repos to include: $repo_names
 
 $(cat "$data_file")"
 
@@ -1162,27 +1182,49 @@ generate_standup_report() {
             echo -e "${DIM}${BOX_TL}─ 📝 Standup${NC}"
             echo -e "${DIM}${BOX_V}${NC}"
 
-            echo -e "${DIM}${BOX_V}${NC}  ${GREEN}${BOLD}Yesterday${NC}"
-            echo "$summary_output" | jq -r '.yesterday[]' 2>/dev/null | while IFS= read -r bullet; do
-                wrap_bullet "$bullet" "$DIM"
-            done
-            echo -e "${DIM}${BOX_V}${NC}"
+            # Iterate repos in the JSON
+            local repo_keys
+            repo_keys=$(echo "$summary_output" | jq -r 'keys[]' 2>/dev/null)
 
-            echo -e "${DIM}${BOX_V}${NC}  ${BLUE}${BOLD}Today${NC}"
-            echo "$summary_output" | jq -r '.today[]' 2>/dev/null | while IFS= read -r bullet; do
-                wrap_bullet "$bullet" "$DIM"
-            done
-            echo -e "${DIM}${BOX_V}${NC}"
+            echo "$repo_keys" | while IFS= read -r repo_key; do
+                [ -z "$repo_key" ] && continue
 
-            echo -e "${DIM}${BOX_V}${NC}  ${YELLOW}${BOLD}Blockers${NC}"
-            echo "$summary_output" | jq -r '.blockers[]' 2>/dev/null | while IFS= read -r bullet; do
-                if [[ "$bullet" == "None" ]] || [[ "$bullet" == "none" ]]; then
-                    echo -e "${DIM}${BOX_V}${NC}     ${DIM}- None${NC}"
-                else
-                    wrap_bullet "$bullet" "$YELLOW"
+                echo -e "${DIM}${BOX_V}${NC}  ${CYAN}${BOLD}$repo_key${NC}"
+
+                # Yesterday
+                local has_yesterday
+                has_yesterday=$(echo "$summary_output" | jq --arg r "$repo_key" '.[$r].yesterday | length' 2>/dev/null || echo "0")
+                if [ "${has_yesterday:-0}" -gt 0 ]; then
+                    echo -e "${DIM}${BOX_V}${NC}   ${GREEN}Yesterday${NC}"
+                    echo "$summary_output" | jq -r --arg r "$repo_key" '.[$r].yesterday[]' 2>/dev/null | while IFS= read -r bullet; do
+                        wrap_bullet "$bullet" "$DIM"
+                    done
                 fi
+
+                # Today
+                local has_today
+                has_today=$(echo "$summary_output" | jq --arg r "$repo_key" '.[$r].today | length' 2>/dev/null || echo "0")
+                if [ "${has_today:-0}" -gt 0 ]; then
+                    echo -e "${DIM}${BOX_V}${NC}   ${BLUE}Today${NC}"
+                    echo "$summary_output" | jq -r --arg r "$repo_key" '.[$r].today[]' 2>/dev/null | while IFS= read -r bullet; do
+                        wrap_bullet "$bullet" "$DIM"
+                    done
+                fi
+
+                # Blockers
+                local has_blockers
+                has_blockers=$(echo "$summary_output" | jq -r --arg r "$repo_key" '.[$r].blockers | if . == null then "0" elif (.[0] // "") == "None" or (.[0] // "") == "none" then "0" else (length | tostring) end' 2>/dev/null || echo "0")
+                if [ "${has_blockers:-0}" -gt 0 ]; then
+                    echo -e "${DIM}${BOX_V}${NC}   ${YELLOW}Blockers${NC}"
+                    echo "$summary_output" | jq -r --arg r "$repo_key" '.[$r].blockers[]' 2>/dev/null | while IFS= read -r bullet; do
+                        [[ "$bullet" == "None" ]] || [[ "$bullet" == "none" ]] && continue
+                        wrap_bullet "$bullet" "$YELLOW"
+                    done
+                fi
+
+                echo -e "${DIM}${BOX_V}${NC}"
             done
-            echo -e "${DIM}${BOX_V}${NC}"
+
             echo -e "${DIM}${BOX_BL}${BOX_H}${NC}"
             echo ""
         fi
