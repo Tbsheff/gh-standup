@@ -1252,19 +1252,48 @@ main() {
 
     check_dependencies
 
-    # Require org — auto-detect from most recent PR activity if not set
+    # Require org — prompt user to choose if not set
     if [ -z "$STANDUP_ORG" ]; then
-        # Find the org where you actually have recent PRs, not just membership
-        STANDUP_ORG=$(gh api graphql -f query='{ search(query: "author:@me is:pr sort:updated-desc", type: ISSUE, first: 1) { nodes { ... on PullRequest { repository { owner { login } } } } } }' --jq '.data.search.nodes[0].repository.owner.login' 2>/dev/null || echo "")
-        if [ -z "$STANDUP_ORG" ]; then
-            # Fallback to first org membership
-            STANDUP_ORG=$(gh api user/orgs --jq '.[0].login' 2>/dev/null || echo "")
-        fi
-        if [ -z "$STANDUP_ORG" ]; then
-            print_error "No GitHub org found. Specify one with --org or STANDUP_ORG env var."
+        local orgs
+        orgs=$(gh api user/orgs --jq '.[].login' 2>/dev/null)
+        local username
+        username=$(gh api user --jq '.login' 2>/dev/null)
+
+        if [ -z "$orgs" ] && [ -z "$username" ]; then
+            print_error "Could not fetch GitHub orgs. Specify one with --org or STANDUP_ORG env var."
             exit 1
         fi
-        print_info "Auto-detected org: ${BOLD}$STANDUP_ORG${NC} (set STANDUP_ORG or use --org to override)"
+
+        echo -e "${BOLD}Select a GitHub org:${NC}"
+        echo ""
+
+        local options=()
+        [ -n "$username" ] && options+=("$username (personal)")
+        while IFS= read -r org; do
+            [ -n "$org" ] && options+=("$org")
+        done <<< "$orgs"
+
+        local i=1
+        for opt in "${options[@]}"; do
+            echo -e "  ${BOLD}$i)${NC} $opt"
+            i=$((i + 1))
+        done
+        echo ""
+        printf "  Enter number: "
+        read -r choice
+
+        if [ -z "$choice" ] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#options[@]} ] 2>/dev/null; then
+            print_error "Invalid choice."
+            exit 1
+        fi
+
+        local selected="${options[$((choice - 1))]}"
+        # Strip " (personal)" suffix if present
+        STANDUP_ORG=$(echo "$selected" | sed 's/ (personal)$//')
+
+        echo ""
+        print_info "Tip: skip this next time with ${BOLD}gh standup --org $STANDUP_ORG${NC} or ${BOLD}export STANDUP_ORG=$STANDUP_ORG${NC}"
+        echo ""
     fi
 
     local today=$(get_today_date)
