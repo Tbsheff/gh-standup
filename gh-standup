@@ -1186,6 +1186,10 @@ parse_args() {
                     exit 1
                 fi
                 STANDUP_ORG="$2"
+                # Save as new default
+                local _cfg="${HOME}/.config/gh-standup/config"
+                mkdir -p "$(dirname "$_cfg")"
+                echo "org=$STANDUP_ORG" > "$_cfg"
                 shift 2
                 ;;
             --summary)
@@ -1252,6 +1256,12 @@ main() {
 
     check_dependencies
 
+    # Load saved config
+    local config_file="${HOME}/.config/gh-standup/config"
+    if [ -z "$STANDUP_ORG" ] && [ -f "$config_file" ]; then
+        STANDUP_ORG=$(grep '^org=' "$config_file" 2>/dev/null | cut -d= -f2-)
+    fi
+
     # Require org — prompt user to choose if not set
     if [ -z "$STANDUP_ORG" ]; then
         local orgs
@@ -1291,8 +1301,12 @@ main() {
         # Strip " (personal)" suffix if present
         STANDUP_ORG=$(echo "$selected" | sed 's/ (personal)$//')
 
+        # Save selection
+        mkdir -p "$(dirname "$config_file")"
+        echo "org=$STANDUP_ORG" > "$config_file"
+
         echo ""
-        print_info "Tip: skip this next time with ${BOLD}gh standup --org $STANDUP_ORG${NC} or ${BOLD}export STANDUP_ORG=$STANDUP_ORG${NC}"
+        print_info "Saved to ${DIM}$config_file${NC} (change with ${BOLD}gh standup --org OTHER${NC})"
         echo ""
     fi
 
